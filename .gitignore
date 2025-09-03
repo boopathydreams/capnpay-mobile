@@ -38,3 +38,6 @@ yarn-error.*
 
 mocks/
 nativewind-env.d.ts
+
+ios/
+android/

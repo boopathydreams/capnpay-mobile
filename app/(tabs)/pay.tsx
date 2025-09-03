@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -7,20 +7,22 @@ import {
   TextInput,
   Modal,
   Alert,
-  Linking,
   Platform,
   Clipboard,
   Image,
+  Animated,
 } from 'react-native';
+import * as Linking from 'expo-linking';
 import { MaterialIcons } from '@expo/vector-icons';
 import ScreenWrapper from '@/components/ScreenWrapper';
 import { DESIGN_SYSTEM } from '@/constants/DesignSystem';
 import { ModernCard } from '@/components/ModernUI';
 import SmartAmountCard from '@/components/SmartAmountCard';
-import SmartUpiApps from '@/components/SmartUpiApps';
+import PaymentOverlay from '@/components/PaymentOverlay';
+import { PaymentFlowManager, PaymentFlowState } from '@/utils/PaymentFlowManager';
 
 // API Configuration
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://192.168.0.103:3000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://192.168.29.114:3000';
 
 // Types for API integration
 interface Category {
@@ -34,15 +36,6 @@ interface SuggestedTag {
   categoryId: string;
   tagText: string;
   confidence: number;
-}
-
-interface PaymentIntent {
-  tr: string;
-  upiDeepLink: string;
-  suggestedTag: SuggestedTag;
-  categoryId: string;
-  capsState: 'ok' | 'near' | 'over';
-  requiresOverride?: boolean;
 }
 
 interface UpiDirectoryEntry {
@@ -107,9 +100,133 @@ export default function PayScreen() {
   const [showTagModal, setShowTagModal] = useState(false);
   const [showPayeeModal, setShowPayeeModal] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [capsState, setCapsState] = useState<'ok' | 'near' | 'over'>('ok');
   const [paymentAnalysis, setPaymentAnalysis] = useState<PaymentAnalysis | null>(null);
   const [selectedUpiApp, setSelectedUpiApp] = useState<string | null>(null);
+
+  // Payment flow state managed by PaymentFlowManager
+  const [paymentFlowState, setPaymentFlowState] = useState<PaymentFlowState>({
+    status: 'idle',
+    message: '',
+    referenceId: null,
+    collectionLinks: null,
+    error: null,
+    canRetry: true,
+  });
+
+  // Payment timer for 3-minute countdown
+  const [paymentTimer, setPaymentTimer] = useState<number>(0);
+  const paymentTimerRef = useRef<any>(null);
+
+  // Payment flow manager instance
+  const paymentFlowManagerRef = useRef<PaymentFlowManager | null>(null);
+
+  const spinValue = useRef(new Animated.Value(0)).current;
+
+  // Initialize payment flow manager
+  useEffect(() => {
+    paymentFlowManagerRef.current = new PaymentFlowManager(API_URL, {
+      onStateChange: (state) => {
+        console.log('🔄 Payment flow state changed:', state);
+        setPaymentFlowState(state);
+      },
+      onSuccess: (referenceId) => {
+        console.log('🎉 Payment successful:', referenceId);
+        stopPaymentTimer();
+        Alert.alert(
+          '✅ Payment Successful!',
+          `₹${amount} has been successfully sent to ${selectedPayee?.name || vpaInput}`,
+          [{ text: 'Done', onPress: resetPaymentFlow }],
+        );
+      },
+      onFailure: (error, canRetry) => {
+        console.log('❌ Payment failed:', error);
+        stopPaymentTimer();
+        Alert.alert('❌ Payment Failed', error, [
+          { text: 'OK', onPress: canRetry ? undefined : resetPaymentFlow },
+        ]);
+      },
+      onTimeout: () => {
+        console.log('⏰ Payment timeout');
+        stopPaymentTimer();
+        Alert.alert(
+          'Payment Timeout',
+          'Payment took too long. Please check your transaction manually.',
+          [{ text: 'OK', onPress: resetPaymentFlow }],
+        );
+      },
+    });
+
+    return () => {
+      // Cleanup on unmount
+      if (paymentFlowManagerRef.current) {
+        paymentFlowManagerRef.current.dispose();
+      }
+      if (paymentTimerRef.current) {
+        clearInterval(paymentTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Start/stop payment timer
+  const startPaymentTimer = () => {
+    console.log('⏰ Starting 3-minute payment timer');
+    setPaymentTimer(180); // 3 minutes = 180 seconds
+
+    if (paymentTimerRef.current) {
+      clearInterval(paymentTimerRef.current);
+    }
+
+    const interval = setInterval(() => {
+      setPaymentTimer((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          paymentTimerRef.current = null;
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    paymentTimerRef.current = interval;
+  };
+
+  const stopPaymentTimer = () => {
+    if (paymentTimerRef.current) {
+      clearInterval(paymentTimerRef.current);
+      paymentTimerRef.current = null;
+    }
+    setPaymentTimer(0);
+  };
+
+  // Reset payment flow
+  const resetPaymentFlow = () => {
+    console.log('🧹 Resetting payment flow completely...');
+
+    // Reset all states
+    setPaymentFlowState({
+      status: 'idle',
+      message: '',
+      referenceId: null,
+      collectionLinks: null,
+      error: null,
+      canRetry: true,
+    });
+
+    // Stop timer
+    stopPaymentTimer();
+
+    // Cancel payment flow manager
+    if (paymentFlowManagerRef.current) {
+      paymentFlowManagerRef.current.cancel();
+    }
+
+    // Reset form
+    setAmount('');
+    setSelectedPayee(null);
+    setVpaInput('');
+    setPaymentAnalysis(null);
+    setSelectedUpiApp(null);
+  };
 
   // Helper functions for UPI app details
   const getUpiAppIcon = (packageName: string) => {
@@ -124,19 +241,19 @@ export default function PayScreen() {
   const getUpiAppColors = (packageName: string) => {
     const colorMap = {
       'com.google.android.apps.nbu.paisa.user': {
-      primary: '#4CAF50',  // Lighter green (was #34A853)
-      light: '#E8F5E8',
-      border: '#81C784',
+        primary: '#4CAF50',
+        light: '#E8F5E8',
+        border: '#81C784',
       },
       'com.phonepe.app': {
-      primary: '#7C3AED',  // Lighter purple (was #5F2EEA)
-      light: '#F3EAFF',
-      border: '#9C7AE8',
+        primary: '#7C3AED',
+        light: '#F3EAFF',
+        border: '#9C7AE8',
       },
       'net.one97.paytm': {
-      primary: '#03DAF6',  // Lighter blue (was #00BAF2)
-      light: '#E3F7FF',
-      border: '#66D4FF',
+        primary: '#03DAF6',
+        light: '#E3F7FF',
+        border: '#66D4FF',
       },
     };
     return (
@@ -157,19 +274,28 @@ export default function PayScreen() {
     return nameMap[packageName as keyof typeof nameMap] || 'UPI App';
   };
 
-  // Load initial data
+  // Animation for loader
+  useEffect(() => {
+    if (
+      paymentFlowState.status !== 'idle' &&
+      paymentFlowState.status !== 'completed' &&
+      paymentFlowState.status !== 'failed'
+    ) {
+      Animated.loop(
+        Animated.timing(spinValue, {
+          toValue: 1,
+          duration: 1000,
+          useNativeDriver: true,
+        }),
+      ).start();
+    }
+  }, [paymentFlowState.status, spinValue]);
+
+  // Load data on mount
   useEffect(() => {
     loadCategories();
     loadRecentPayees();
   }, []);
-
-  // Auto-select recommended UPI app when payment analysis updates
-  useEffect(() => {
-    if (paymentAnalysis?.upiOptions?.recommendedApp && !selectedUpiApp) {
-      console.log('Auto-selecting recommended app:', paymentAnalysis.upiOptions.recommendedApp);
-      setSelectedUpiApp(paymentAnalysis.upiOptions.recommendedApp);
-    }
-  }, [paymentAnalysis]);
 
   const loadCategories = async () => {
     try {
@@ -183,330 +309,62 @@ export default function PayScreen() {
 
   const loadRecentPayees = async () => {
     try {
-      const response = await fetch(`${API_URL}/upi-directory/entries`);
-      const data = await response.json();
-      setRecentPayees(data.slice(0, 5)); // Show top 5 recent
+      const mockPayees: UpiDirectoryEntry[] = [
+        { phone: '+919876543210', vpa: 'john.doe@paytm', name: 'John Doe', handle: 'paytm' },
+        {
+          phone: '+919876543211',
+          vpa: 'alice.smith@phonepe',
+          name: 'Alice Smith',
+          handle: 'phonepe',
+        },
+        { phone: '+919876543212', vpa: 'bob.wilson@gpay', name: 'Bob Wilson', handle: 'gpay' },
+      ];
+      setRecentPayees(mockPayees);
     } catch (error) {
       console.error('Failed to load recent payees:', error);
     }
   };
 
-  const handleAmountPreset = (presetAmount: string) => {
-    setAmount(presetAmount);
+  // New Professional Payment Flow Handler using PaymentFlowManager
+  const handleConfirmPayment = async () => {
+    if (!amount || (!selectedPayee && !vpaInput)) {
+      Alert.alert('Missing Information', 'Please enter amount and select payee');
+      return;
+    }
+
+    console.log('🚀 Starting professional payment flow...');
+
+    // Start the payment using the professional flow manager
+    if (paymentFlowManagerRef.current) {
+      startPaymentTimer();
+
+      await paymentFlowManagerRef.current.startPayment({
+        amount: parseFloat(amount),
+        recipientVpa: selectedPayee?.vpa || vpaInput,
+        recipientName: selectedPayee?.name,
+        category: paymentAnalysis?.suggestedTag?.category?.name || 'Payment',
+        note: paymentAnalysis?.suggestedTag?.tagText || "Escrow payment via Cap'n Pay",
+      });
+    }
   };
 
+  // Handle UPI App Selection using PaymentFlowManager
+  const handleUpiAppSelection = (appName: string) => {
+    console.log(`🎯 Selected UPI app: ${appName}`);
+
+    setSelectedUpiApp(appName);
+
+    // Delegate to the payment flow manager
+    if (paymentFlowManagerRef.current) {
+      paymentFlowManagerRef.current.selectUpiApp(appName);
+    }
+  };
+
+  // Handle payee selection from modal
   const handlePayeeSelect = (payee: UpiDirectoryEntry) => {
     setSelectedPayee(payee);
-    setVpaInput(payee.vpa);
+    setVpaInput('');
     setShowPayeeModal(false);
-  };
-
-  const createPaymentIntent = async () => {
-    if (!amount || (!selectedPayee && !vpaInput)) {
-      Alert.alert('Missing Information', 'Please enter amount and select payee');
-      return;
-    }
-
-    setIsLoading(true);
-    try {
-      const response = await fetch(`${API_URL}/pay-intents`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          amount: parseFloat(amount),
-          vpa: selectedPayee?.vpa || vpaInput,
-          payeeName: selectedPayee?.name,
-          entrypoint: 'pay_screen',
-          platform: Platform.OS.toUpperCase(),
-        }),
-      });
-
-      const paymentIntent: PaymentIntent = await response.json();
-
-      setSelectedTag(paymentIntent.suggestedTag);
-      setCapsState(paymentIntent.capsState);
-      setShowTagModal(true);
-    } catch (error) {
-      console.error('Failed to create payment intent:', error);
-      Alert.alert('Error', 'Failed to create payment. Please try again.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const completePayment = async (trRef: string, status: string) => {
-    try {
-      await fetch(`${API_URL}/pay-intents/${trRef}/complete`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          status: status,
-          upiTxnRef: status === 'SUCCESS' ? `UPI${Date.now()}` : undefined,
-        }),
-      });
-
-      // Reset form
-      setAmount('');
-      setSelectedPayee(null);
-      setVpaInput('');
-      setSelectedTag(null);
-
-      Alert.alert(
-        'Payment Complete',
-        status === 'SUCCESS' ? 'Payment completed successfully!' : 'Payment marked as failed',
-      );
-    } catch (error) {
-      console.error('Failed to complete payment:', error);
-    }
-  };
-
-  const launchUpiIntent = async () => {
-    if (!selectedTag) return;
-
-    setIsLoading(true);
-    try {
-      // Create payment intent to get UPI deep link
-      const response = await fetch(`${API_URL}/pay-intents`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          amount: parseFloat(amount),
-          vpa: selectedPayee?.vpa || vpaInput,
-          payeeName: selectedPayee?.name,
-          entrypoint: 'pay_screen_confirm',
-          platform: Platform.OS.toUpperCase(),
-        }),
-      });
-
-      const paymentIntent: PaymentIntent = await response.json();
-
-      // Check if we're in Expo Go development environment
-      const isExpoGo = process.env.EXPO_PUBLIC_ENVIRONMENT === 'development';
-
-      if (isExpoGo) {
-        // In Expo Go, simulate UPI flow for testing
-        Alert.alert(
-          'UPI Payment Simulation',
-          `Amount: ₹${amount}\nTo: ${selectedPayee?.name || vpaInput}\nCategory: ${selectedTag?.tagText}`,
-          [
-            {
-              text: 'Copy UPI Link',
-              style: 'default',
-              onPress: () => {
-                Clipboard.setString(paymentIntent.upiDeepLink);
-                Alert.alert('Copied!', 'UPI link copied to clipboard');
-              },
-            },
-            {
-              text: 'Simulate Failed',
-              style: 'destructive',
-              onPress: () => completePayment(paymentIntent.tr, 'FAILED'),
-            },
-            {
-              text: 'Simulate Success',
-              style: 'default',
-              onPress: () => completePayment(paymentIntent.tr, 'SUCCESS'),
-            },
-          ],
-        );
-      } else {
-        // Production: Try to launch UPI intent
-        const canOpen = await Linking.canOpenURL(paymentIntent.upiDeepLink);
-
-        if (canOpen) {
-          await Linking.openURL(paymentIntent.upiDeepLink);
-
-          // For iOS or if callback doesn't work, show manual confirmation
-          if (Platform.OS === 'ios') {
-            setTimeout(() => {
-              Alert.alert('Payment Status', 'Was your payment successful?', [
-                {
-                  text: 'Failed',
-                  style: 'destructive',
-                  onPress: () => completePayment(paymentIntent.tr, 'FAILED'),
-                },
-                {
-                  text: 'Success',
-                  style: 'default',
-                  onPress: () => completePayment(paymentIntent.tr, 'SUCCESS'),
-                },
-              ]);
-            }, 3000); // Give time for UPI app to return
-          } else {
-            // Android - simulate callback handling (in real app, this would be handled by deep link)
-            setTimeout(() => {
-              completePayment(paymentIntent.tr, 'SUCCESS');
-            }, 5000);
-          }
-        } else {
-          Alert.alert(
-            'UPI App Not Found',
-            'Please install a UPI app like PhonePe, Google Pay, or Paytm to complete the payment.',
-            [
-              {
-                text: 'OK',
-                onPress: () => completePayment(paymentIntent.tr, 'FAILED'),
-              },
-            ],
-          );
-        }
-      }
-    } catch (error) {
-      console.error('Failed to launch UPI intent:', error);
-      Alert.alert('Error', 'Failed to launch payment. Please try again.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const launchUpiPaymentDirect = async (preferredApp?: string) => {
-    if (!amount || (!selectedPayee && !vpaInput)) {
-      Alert.alert('Missing Information', 'Please enter amount and select payee');
-      return;
-    }
-
-    setIsLoading(true);
-    try {
-      // Create payment intent to get UPI deep link
-      const response = await fetch(`${API_URL}/pay-intents`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          amount: parseFloat(amount),
-          vpa: selectedPayee?.vpa || vpaInput,
-          payeeName: selectedPayee?.name,
-          entrypoint: 'pay_screen_direct',
-          platform: Platform.OS.toUpperCase(),
-        }),
-      });
-
-      const paymentIntent: PaymentIntent = await response.json();
-
-      // Check if we're in Expo Go development environment
-      const isExpoGo = process.env.EXPO_PUBLIC_ENVIRONMENT === 'development';
-
-      if (isExpoGo) {
-        // In Expo Go, simulate UPI flow for testing
-        Alert.alert(
-          'UPI Payment Simulation',
-          `Amount: ₹${amount}\nTo: ${selectedPayee?.name || vpaInput}\nApp: ${preferredApp || 'Default'}\nCategory: ${paymentAnalysis?.suggestedTag?.tagText || 'General'}`,
-          [
-            {
-              text: 'Copy UPI Link',
-              style: 'default',
-              onPress: () => {
-                Clipboard.setString(paymentIntent.upiDeepLink);
-                Alert.alert('Copied!', 'UPI link copied to clipboard');
-              },
-            },
-            {
-              text: 'Simulate Failed',
-              style: 'destructive',
-              onPress: () => completePayment(paymentIntent.tr, 'FAILED'),
-            },
-            {
-              text: 'Simulate Success',
-              style: 'default',
-              onPress: () => completePayment(paymentIntent.tr, 'SUCCESS'),
-            },
-          ],
-        );
-      } else {
-        // Production: Try to launch UPI intent with preferred app
-        let upiLink = paymentIntent.upiDeepLink;
-
-        // Modify UPI link for specific app if provided
-        if (preferredApp) {
-          // This would typically involve app-specific URL schemes
-          // For now, we'll use the generic UPI link
-        }
-
-        const canOpen = await Linking.canOpenURL(upiLink);
-
-        if (canOpen) {
-          await Linking.openURL(upiLink);
-
-          // For iOS or if callback doesn't work, show manual confirmation
-          if (Platform.OS === 'ios') {
-            setTimeout(() => {
-              Alert.alert('Payment Status', 'Was your payment successful?', [
-                {
-                  text: 'Failed',
-                  style: 'destructive',
-                  onPress: () => completePayment(paymentIntent.tr, 'FAILED'),
-                },
-                {
-                  text: 'Success',
-                  style: 'default',
-                  onPress: () => completePayment(paymentIntent.tr, 'SUCCESS'),
-                },
-              ]);
-            }, 3000);
-          } else {
-            // Android - simulate callback handling
-            setTimeout(() => {
-              completePayment(paymentIntent.tr, 'SUCCESS');
-            }, 5000);
-          }
-        } else {
-          Alert.alert(
-            'UPI App Not Found',
-            'Please install a UPI app like PhonePe, Google Pay, or Paytm to complete the payment.',
-            [
-              {
-                text: 'OK',
-                onPress: () => completePayment(paymentIntent.tr, 'FAILED'),
-              },
-            ],
-          );
-        }
-      }
-    } catch (error) {
-      console.error('Failed to launch UPI payment:', error);
-      Alert.alert('Error', 'Failed to launch payment. Please try again.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // Test function
-  const handleTestButton = () => {
-    Alert.alert('Test Button', 'This is a test button for development', [
-      {
-        text: 'Test Payment Flow',
-        onPress: () => {
-          setAmount('100');
-          setSelectedPayee({
-            phone: '+919876543210',
-            vpa: 'test@paytm',
-            name: 'Test User',
-            handle: 'paytm',
-          });
-        },
-      },
-      {
-        text: 'Test Analysis',
-        onPress: () => {
-          if (paymentAnalysis) {
-            Alert.alert('Payment Analysis', JSON.stringify(paymentAnalysis, null, 2));
-          } else {
-            Alert.alert('No Analysis', 'Enter amount and payee first');
-          }
-        },
-      },
-      {
-        text: 'Cancel',
-        style: 'cancel',
-      },
-    ]);
   };
 
   return (
@@ -549,116 +407,72 @@ export default function PayScreen() {
                   style={{
                     fontSize: 14,
                     color: DESIGN_SYSTEM.colors.primary[600],
-                    fontWeight: '600',
+                    fontWeight: '500',
                   }}
                 >
-                  More
+                  View All
                 </Text>
               </TouchableOpacity>
             </View>
 
-            {/* Horizontal Recent Payees */}
             <ScrollView horizontal showsHorizontalScrollIndicator={false}>
               <View style={{ flexDirection: 'row', gap: 12 }}>
-                {/* Add New Payee Button */}
-                <TouchableOpacity
-                  style={{
-                    alignItems: 'center',
-                    padding: 12,
-                    borderRadius: DESIGN_SYSTEM.borderRadius.md,
-                    borderWidth: 2,
-                    borderStyle: 'dashed',
-                    borderColor: DESIGN_SYSTEM.colors.primary[300],
-                    backgroundColor: DESIGN_SYSTEM.colors.primary[50],
-                    minWidth: 70,
-                  }}
-                  onPress={() => setShowPayeeModal(true)}
-                >
-                  <View
-                    style={{
-                      width: 32,
-                      height: 32,
-                      borderRadius: 16,
-                      backgroundColor: DESIGN_SYSTEM.colors.primary[100],
-                      justifyContent: 'center',
-                      alignItems: 'center',
-                      marginBottom: 4,
-                    }}
-                  >
-                    <MaterialIcons name="add" size={18} color={DESIGN_SYSTEM.colors.primary[600]} />
-                  </View>
-                  <Text
-                    style={{
-                      fontSize: 12,
-                      color: DESIGN_SYSTEM.colors.primary[600],
-                      fontWeight: '600',
-                      textAlign: 'center',
-                    }}
-                  >
-                    New
-                  </Text>
-                </TouchableOpacity>
-
-                {/* Recent Payees */}
-                {recentPayees.map((payee) => (
+                {recentPayees.map((payee, index) => (
                   <TouchableOpacity
-                    key={`${payee.phone}-${payee.vpa}`}
+                    key={index}
                     style={{
                       alignItems: 'center',
                       padding: 12,
                       borderRadius: DESIGN_SYSTEM.borderRadius.md,
-                      borderWidth: 2,
+                      backgroundColor: DESIGN_SYSTEM.colors.neutral[50],
+                      minWidth: 80,
+                      borderWidth: selectedPayee?.vpa === payee.vpa ? 2 : 1,
                       borderColor:
                         selectedPayee?.vpa === payee.vpa
                           ? DESIGN_SYSTEM.colors.primary[500]
                           : DESIGN_SYSTEM.colors.neutral[200],
-                      backgroundColor:
-                        selectedPayee?.vpa === payee.vpa
-                          ? DESIGN_SYSTEM.colors.primary[50]
-                          : DESIGN_SYSTEM.colors.light.surface,
-                      minWidth: 70,
                     }}
-                    onPress={() => handlePayeeSelect(payee)}
+                    onPress={() => {
+                      setSelectedPayee(payee);
+                      setVpaInput('');
+                    }}
                   >
                     <View
                       style={{
-                        width: 32,
-                        height: 32,
-                        borderRadius: 16,
-                        backgroundColor:
-                          selectedPayee?.vpa === payee.vpa
-                            ? DESIGN_SYSTEM.colors.primary[500]
-                            : DESIGN_SYSTEM.colors.primary[100],
-                        justifyContent: 'center',
+                        width: 40,
+                        height: 40,
+                        borderRadius: 20,
+                        backgroundColor: DESIGN_SYSTEM.colors.primary[100],
                         alignItems: 'center',
-                        marginBottom: 4,
+                        justifyContent: 'center',
+                        marginBottom: 6,
                       }}
                     >
                       <Text
                         style={{
-                          color:
-                            selectedPayee?.vpa === payee.vpa
-                              ? 'white'
-                              : DESIGN_SYSTEM.colors.primary[600],
-                          fontWeight: '700',
-                          fontSize: 14,
+                          fontSize: 16,
+                          fontWeight: '600',
+                          color: DESIGN_SYSTEM.colors.primary[700],
                         }}
                       >
-                        {payee.name.charAt(0).toUpperCase()}
+                        {payee.name
+                          .split(' ')
+                          .map((n) => n[0])
+                          .join('')
+                          .substring(0, 2)
+                          .toUpperCase()}
                       </Text>
                     </View>
                     <Text
                       style={{
                         fontSize: 12,
-                        fontWeight: '600',
-                        color:
-                          selectedPayee?.vpa === payee.vpa
-                            ? DESIGN_SYSTEM.colors.primary[700]
-                            : DESIGN_SYSTEM.colors.light.text,
+                        fontWeight: '500',
                         textAlign: 'center',
+                        color: DESIGN_SYSTEM.colors.light.text,
                       }}
+                      numberOfLines={1}
                     >
-                      {payee.name.length > 8 ? payee.name.substring(0, 8) + '...' : payee.name}
+                      {payee.name.split(' ')[0]}
                     </Text>
                   </TouchableOpacity>
                 ))}
@@ -695,7 +509,7 @@ export default function PayScreen() {
                     color: DESIGN_SYSTEM.colors.success[700],
                   }}
                 >
-                  Paying {selectedPayee.name}
+                  Paying to {selectedPayee.name}
                 </Text>
                 <Text
                   style={{
@@ -709,561 +523,340 @@ export default function PayScreen() {
             </View>
           )}
 
-          {/* Smart UPI Apps - Show when payment analysis is available */}
-          {paymentAnalysis?.upiOptions && (
-            <View style={{ paddingHorizontal: 24, paddingBottom: 24 }}>
-              <SmartUpiApps
-                apps={paymentAnalysis.upiOptions.availableApps}
-                recommendedApp={paymentAnalysis.upiOptions.recommendedApp}
-                onAppSelect={(packageName) => {
-                  console.log('Selected UPI app:', packageName);
-                  launchUpiPaymentDirect(packageName);
-                }}
-                onAppSelectionChange={(selectedApp) => {
-                  console.log('App selection changed:', selectedApp);
-                  setSelectedUpiApp(selectedApp);
-                }}
-                vpa={selectedPayee?.vpa || vpaInput}
-                amount={amount}
-                payeeName={selectedPayee?.name || vpaInput}
-              />
-            </View>
-          )}
-        </ScrollView>
-
-        {/* Dynamic Pay/Test Button */}
-        {selectedUpiApp && amount && (selectedPayee || vpaInput) && (
-          <TouchableOpacity
-            style={{
-              position: 'absolute',
-              bottom: 0,
-              // left: 24,
-              // right: 24,
-              width: '100%',
-              height: 60,
-              backgroundColor: selectedUpiApp
-                ? getUpiAppColors(selectedUpiApp).border
-                : DESIGN_SYSTEM.colors.warning[500],
-              paddingVertical: 16,
-              // borderRadius: DESIGN_SYSTEM.borderRadius.xl,
-              alignItems: 'center',
-              flexDirection: 'row',
-              justifyContent: 'center',
-              shadowColor: selectedUpiApp ? getUpiAppColors(selectedUpiApp).primary : '#000',
-              shadowOffset: { width: 0, height: 4 },
-              shadowOpacity: 0.15,
-              shadowRadius: 8,
-              elevation: 5,
-            }}
-            onPress={
-              selectedUpiApp && amount && (selectedPayee || vpaInput)
-                ? () => launchUpiPaymentDirect(selectedUpiApp)
-                : handleTestButton
-            }
-          >
-            <>
-              {/* UPI App Icon */}
-              {getUpiAppIcon(selectedUpiApp) && (
-                <Image
-                  source={getUpiAppIcon(selectedUpiApp)}
-                  style={{
-                    width: 24,
-                    height: 24,
-                    marginRight: 12,
-                    borderRadius: 6,
-                  }}
-                  resizeMode="contain"
-                />
-              )}
-              <Text
-                style={{
-                  color: 'white',
-                  fontSize: 16,
-                  fontWeight: '700',
-                  marginRight: 8,
-                }}
-              >
-                Pay ₹{amount} via {getUpiAppName(selectedUpiApp)}
-              </Text>
-              <MaterialIcons name="arrow-forward" size={20} color="white" />
-            </>
-          </TouchableOpacity>
-        )}
-      </View>
-
-      {/* Payee Modal */}
-      <Modal visible={showPayeeModal} animationType="slide" presentationStyle="pageSheet">
-        <View style={{ flex: 1, backgroundColor: DESIGN_SYSTEM.colors.light.background }}>
-          {/* Modal Header */}
-          <View
-            style={{
-              padding: 24,
-              borderBottomWidth: 1,
-              borderColor: DESIGN_SYSTEM.colors.neutral[200],
-              backgroundColor: DESIGN_SYSTEM.colors.light.surface,
-            }}
-          >
-            <View
-              style={{
-                flexDirection: 'row',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-              }}
-            >
-              <Text
-                style={{
-                  fontSize: 20,
-                  fontWeight: '700',
-                  color: DESIGN_SYSTEM.colors.light.text,
-                }}
-              >
-                Select Payee
-              </Text>
-              <TouchableOpacity onPress={() => setShowPayeeModal(false)}>
-                <MaterialIcons
-                  name="close"
-                  size={24}
-                  color={DESIGN_SYSTEM.colors.light.textSecondary}
-                />
-              </TouchableOpacity>
-            </View>
-          </View>
-
-          {/* Tab Navigation */}
-          <View
-            style={{
-              flexDirection: 'row',
-              backgroundColor: DESIGN_SYSTEM.colors.light.surface,
-              paddingHorizontal: 24,
-              paddingTop: 16,
-            }}
-          >
-            {[
-              { key: 'recent', label: 'Recent' },
-              { key: 'contacts', label: 'Contacts' },
-              { key: 'upi', label: 'UPI ID' },
-            ].map((tab) => (
-              <TouchableOpacity
-                key={tab.key}
-                style={{
-                  paddingHorizontal: 16,
-                  paddingVertical: 8,
-                  borderRadius: DESIGN_SYSTEM.borderRadius.md,
-                  marginRight: 8,
-                  backgroundColor:
-                    activeTab === tab.key ? DESIGN_SYSTEM.colors.primary[500] : 'transparent',
-                }}
-                onPress={() => setActiveTab(tab.key as any)}
-              >
-                <Text
-                  style={{
-                    fontWeight: '600',
-                    color:
-                      activeTab === tab.key ? 'white' : DESIGN_SYSTEM.colors.light.textSecondary,
-                  }}
-                >
-                  {tab.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          {/* Tab Content */}
-          <ScrollView style={{ flex: 1, padding: 24 }}>
-            {activeTab === 'recent' && (
-              <View>
-                {recentPayees.map((payee) => (
-                  <TouchableOpacity
-                    key={payee.vpa}
-                    style={{
-                      flexDirection: 'row',
-                      alignItems: 'center',
-                      backgroundColor: DESIGN_SYSTEM.colors.light.surface,
-                      borderRadius: DESIGN_SYSTEM.borderRadius.lg,
-                      padding: 16,
-                      marginBottom: 12,
-                      borderWidth: 1,
-                      borderColor: DESIGN_SYSTEM.colors.neutral[200],
-                    }}
-                    onPress={() => handlePayeeSelect(payee)}
-                  >
-                    <View
-                      style={{
-                        width: 48,
-                        height: 48,
-                        borderRadius: 24,
-                        backgroundColor:
-                          payee.name === 'Zomato'
-                            ? '#E23744'
-                            : payee.name === 'Myntra'
-                              ? '#FF3F6C'
-                              : payee.name === 'Uber'
-                                ? '#000000'
-                                : DESIGN_SYSTEM.colors.primary[100],
-                        justifyContent: 'center',
-                        alignItems: 'center',
-                        marginRight: 16,
-                      }}
-                    >
-                      <Text
-                        style={{
-                          fontWeight: '700',
-                          fontSize: 18,
-                          color:
-                            payee.name === 'Zomato' ||
-                            payee.name === 'Myntra' ||
-                            payee.name === 'Uber'
-                              ? 'white'
-                              : DESIGN_SYSTEM.colors.primary[600],
-                        }}
-                      >
-                        {payee.name.charAt(0)}
-                      </Text>
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text
-                        style={{
-                          fontWeight: '600',
-                          fontSize: 16,
-                          color: DESIGN_SYSTEM.colors.light.text,
-                          marginBottom: 4,
-                        }}
-                      >
-                        {payee.name}
-                      </Text>
-                      <Text
-                        style={{
-                          color: DESIGN_SYSTEM.colors.light.textSecondary,
-                          fontSize: 14,
-                        }}
-                      >
-                        {payee.vpa}
-                      </Text>
-                    </View>
-                    <MaterialIcons
-                      name="chevron-right"
-                      size={20}
-                      color={DESIGN_SYSTEM.colors.light.textSecondary}
-                    />
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-
-            {activeTab === 'upi' && (
-              <View>
-                <Text
-                  style={{
-                    fontSize: 16,
-                    fontWeight: '600',
-                    color: DESIGN_SYSTEM.colors.light.text,
-                    marginBottom: 16,
-                  }}
-                >
-                  Enter UPI ID
-                </Text>
-                <TextInput
-                  style={{
-                    backgroundColor: DESIGN_SYSTEM.colors.light.surface,
-                    borderRadius: DESIGN_SYSTEM.borderRadius.lg,
-                    padding: 16,
-                    fontSize: 16,
-                    borderWidth: 1,
-                    borderColor: DESIGN_SYSTEM.colors.neutral[200],
-                    marginBottom: 24,
-                  }}
-                  value={vpaInput}
-                  onChangeText={setVpaInput}
-                  placeholder="Enter UPI ID (e.g., user@paytm)"
-                  placeholderTextColor={DESIGN_SYSTEM.colors.light.textSecondary}
-                  autoCapitalize="none"
-                />
-                {vpaInput && (
-                  <TouchableOpacity
-                    style={{
-                      backgroundColor: DESIGN_SYSTEM.colors.primary[500],
-                      paddingVertical: 16,
-                      borderRadius: DESIGN_SYSTEM.borderRadius.lg,
-                      alignItems: 'center',
-                    }}
-                    onPress={() => {
-                      if (vpaInput) {
-                        setSelectedPayee({
-                          phone: '',
-                          vpa: vpaInput,
-                          name: vpaInput.split('@')[0],
-                          handle: vpaInput.split('@')[1] || '',
-                        });
-                        setShowPayeeModal(false);
-                      }
-                    }}
-                  >
-                    <Text style={{ color: 'white', fontSize: 16, fontWeight: '600' }}>
-                      Select This UPI ID
-                    </Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            )}
-
-            {activeTab === 'contacts' && (
-              <View
-                style={{
-                  alignItems: 'center',
-                  paddingVertical: 40,
-                }}
-              >
-                <MaterialIcons
-                  name="contacts"
-                  size={48}
-                  color={DESIGN_SYSTEM.colors.neutral[400]}
-                />
-                <Text
-                  style={{
-                    fontSize: 16,
-                    color: DESIGN_SYSTEM.colors.light.textSecondary,
-                    textAlign: 'center',
-                    marginTop: 16,
-                  }}
-                >
-                  Contact integration coming soon
-                </Text>
-              </View>
-            )}
-          </ScrollView>
-        </View>
-      </Modal>
-
-      {/* Tag Modal */}
-      <Modal visible={showTagModal} animationType="slide" presentationStyle="pageSheet">
-        <View style={{ flex: 1, backgroundColor: DESIGN_SYSTEM.colors.light.background }}>
-          {/* Modal Header */}
-          <View
-            style={{
-              padding: 24,
-              borderBottomWidth: 1,
-              borderColor: DESIGN_SYSTEM.colors.neutral[200],
-              backgroundColor: DESIGN_SYSTEM.colors.light.surface,
-            }}
-          >
+          {/* UPI Input */}
+          <View style={{ paddingHorizontal: 24, paddingBottom: 16 }}>
             <Text
               style={{
-                fontSize: 20,
-                fontWeight: '700',
-                textAlign: 'center',
-                color: DESIGN_SYSTEM.colors.light.text,
+                fontSize: 14,
+                fontWeight: '500',
+                color: DESIGN_SYSTEM.colors.light.textSecondary,
+                marginBottom: 8,
               }}
             >
-              Confirm Payment
+              Or enter UPI ID
             </Text>
+            <TextInput
+              style={{
+                borderWidth: 1,
+                borderColor: DESIGN_SYSTEM.colors.neutral[300],
+                borderRadius: DESIGN_SYSTEM.borderRadius.md,
+                paddingHorizontal: 16,
+                paddingVertical: 12,
+                fontSize: 16,
+                backgroundColor: 'white',
+              }}
+              placeholder="someone@paytm"
+              value={vpaInput}
+              onChangeText={(text) => {
+                setVpaInput(text);
+                setSelectedPayee(null);
+              }}
+              keyboardType="email-address"
+              autoCapitalize="none"
+            />
           </View>
 
-          <ScrollView style={{ flex: 1 }}>
-            {/* Payment Summary */}
-            <View style={{ padding: 24 }}>
-              <ModernCard
-                style={{
-                  backgroundColor: DESIGN_SYSTEM.colors.primary[50],
-                  borderRadius: DESIGN_SYSTEM.borderRadius['2xl'],
-                  padding: DESIGN_SYSTEM.spacing.xl,
-                  borderColor: DESIGN_SYSTEM.colors.primary[200],
-                  borderWidth: 1,
-                  alignItems: 'center',
-                  marginBottom: 24,
-                }}
-              >
-                <Text
-                  style={{
-                    fontSize: 48,
-                    fontWeight: '800',
-                    color: DESIGN_SYSTEM.colors.primary[700],
-                  }}
-                >
-                  ₹{amount}
-                </Text>
-                <Text
-                  style={{
-                    color: DESIGN_SYSTEM.colors.primary[600],
-                    marginTop: 8,
-                    fontSize: 16,
-                    fontWeight: '500',
-                  }}
-                >
-                  to {selectedPayee?.name || vpaInput}
-                </Text>
-              </ModernCard>
-
-              {/* Caps Warning */}
-              {capsState !== 'ok' && (
-                <ModernCard
-                  style={{
-                    backgroundColor:
-                      capsState === 'over'
-                        ? DESIGN_SYSTEM.colors.error[50]
-                        : DESIGN_SYSTEM.colors.warning[50],
-                    borderRadius: DESIGN_SYSTEM.borderRadius.lg,
-                    padding: 16,
-                    borderColor:
-                      capsState === 'over'
-                        ? DESIGN_SYSTEM.colors.error[200]
-                        : DESIGN_SYSTEM.colors.warning[200],
-                    borderWidth: 1,
-                    marginBottom: 24,
-                  }}
-                >
-                  <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
-                    <MaterialIcons
-                      name={capsState === 'over' ? 'warning' : 'info'}
-                      size={20}
-                      color={
-                        capsState === 'over'
-                          ? DESIGN_SYSTEM.colors.error[600]
-                          : DESIGN_SYSTEM.colors.warning[600]
-                      }
-                    />
-                    <Text
-                      style={{
-                        fontWeight: '600',
-                        marginLeft: 8,
-                        color:
-                          capsState === 'over'
-                            ? DESIGN_SYSTEM.colors.error[600]
-                            : DESIGN_SYSTEM.colors.warning[600],
-                      }}
-                    >
-                      {capsState === 'over' ? 'Cap Exceeded' : 'Near Cap Limit'}
-                    </Text>
-                  </View>
-                  <Text
-                    style={{
-                      fontSize: 14,
-                      color:
-                        capsState === 'over'
-                          ? DESIGN_SYSTEM.colors.error[600]
-                          : DESIGN_SYSTEM.colors.warning[600],
-                    }}
-                  >
-                    {capsState === 'over'
-                      ? 'This payment will exceed your category spending limit.'
-                      : 'This payment will bring you close to your spending limit.'}
-                  </Text>
-                </ModernCard>
-              )}
-
-              {/* AI Tag Suggestion */}
-              {selectedTag && (
-                <ModernCard
-                  style={{
-                    backgroundColor: DESIGN_SYSTEM.colors.success[50],
-                    borderRadius: DESIGN_SYSTEM.borderRadius.lg,
-                    padding: 16,
-                    borderColor: DESIGN_SYSTEM.colors.success[200],
-                    borderWidth: 1,
-                    marginBottom: 24,
-                  }}
-                >
-                  <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
-                    <MaterialIcons
-                      name="local-offer"
-                      size={20}
-                      color={DESIGN_SYSTEM.colors.success[600]}
-                    />
-                    <Text
-                      style={{
-                        fontWeight: '600',
-                        marginLeft: 8,
-                        color: DESIGN_SYSTEM.colors.success[600],
-                      }}
-                    >
-                      AI Suggested Tag
-                    </Text>
-                    <View
-                      style={{
-                        backgroundColor: DESIGN_SYSTEM.colors.success[100],
-                        paddingHorizontal: 8,
-                        paddingVertical: 2,
-                        borderRadius: 12,
-                        marginLeft: 'auto',
-                      }}
-                    >
-                      <Text
-                        style={{
-                          fontSize: 10,
-                          color: DESIGN_SYSTEM.colors.success[600],
-                          fontWeight: '500',
-                        }}
-                      >
-                        {Math.round(selectedTag.confidence * 100)}% confidence
-                      </Text>
-                    </View>
-                  </View>
-                  <Text
-                    style={{
-                      fontSize: 16,
-                      fontWeight: '600',
-                      color: DESIGN_SYSTEM.colors.success[700],
-                    }}
-                  >
-                    {selectedTag.tagText}
-                  </Text>
-                </ModernCard>
-              )}
-            </View>
-          </ScrollView>
-
-          {/* Action Buttons */}
-          <View
-            style={{
-              padding: 24,
-              backgroundColor: DESIGN_SYSTEM.colors.light.surface,
-              borderTopWidth: 1,
-              borderTopColor: DESIGN_SYSTEM.colors.neutral[200],
-            }}
-          >
+          {/* Payment Button */}
+          <View style={{ paddingHorizontal: 24, paddingBottom: 24 }}>
             <TouchableOpacity
               style={{
-                backgroundColor: DESIGN_SYSTEM.colors.primary[500],
+                backgroundColor:
+                  !amount || (!selectedPayee && !vpaInput) || paymentFlowState.status !== 'idle'
+                    ? DESIGN_SYSTEM.colors.neutral[300]
+                    : DESIGN_SYSTEM.colors.primary[600],
                 paddingVertical: 16,
-                borderRadius: DESIGN_SYSTEM.borderRadius.xl,
+                borderRadius: DESIGN_SYSTEM.borderRadius.lg,
                 alignItems: 'center',
-                marginBottom: 12,
+                flexDirection: 'row',
+                justifyContent: 'center',
+                gap: 8,
               }}
-              onPress={async () => {
-                setShowTagModal(false);
-                await launchUpiIntent();
-              }}
+              disabled={
+                !amount || (!selectedPayee && !vpaInput) || paymentFlowState.status !== 'idle'
+              }
+              onPress={handleConfirmPayment}
             >
+              {paymentFlowState.status !== 'idle' ? (
+                <Animated.View
+                  style={{
+                    transform: [
+                      {
+                        rotate: spinValue.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: ['0deg', '360deg'],
+                        }),
+                      },
+                    ],
+                  }}
+                >
+                  <MaterialIcons name="sync" size={20} color="white" />
+                </Animated.View>
+              ) : (
+                <MaterialIcons name="wallet" size={20} color="white" />
+              )}
               <Text
                 style={{
                   color: 'white',
-                  fontSize: 18,
-                  fontWeight: '700',
-                }}
-              >
-                Pay Now
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={{
-                paddingVertical: 16,
-                alignItems: 'center',
-              }}
-              onPress={() => setShowTagModal(false)}
-            >
-              <Text
-                style={{
-                  color: DESIGN_SYSTEM.colors.light.textSecondary,
                   fontSize: 16,
                   fontWeight: '600',
                 }}
               >
-                Cancel
+                {paymentFlowState.status !== 'idle' ? 'Processing...' : `Confirm`}
               </Text>
             </TouchableOpacity>
           </View>
-        </View>
-      </Modal>
+        </ScrollView>
+
+        {/* Payment Overlay */}
+        <PaymentOverlay
+          visible={
+            paymentFlowState.status !== 'idle' && paymentFlowState.status !== 'waiting_payment'
+          }
+          paymentStatus={paymentFlowState.status}
+          paymentStatusMessage={paymentFlowState.message}
+          paymentTimer={paymentTimer}
+          spinValue={spinValue}
+          collectionLinks={paymentFlowState.collectionLinks}
+          onUpiAppSelection={handleUpiAppSelection}
+          onReset={resetPaymentFlow}
+        />
+
+        {/* Payee Selection Modal */}
+        <Modal
+          visible={showPayeeModal}
+          animationType="slide"
+          presentationStyle="pageSheet"
+          onRequestClose={() => setShowPayeeModal(false)}
+        >
+          <View style={{ flex: 1, backgroundColor: DESIGN_SYSTEM.colors.light.background }}>
+            {/* Modal Header */}
+            <View
+              style={{
+                padding: 24,
+                borderBottomWidth: 1,
+                borderColor: DESIGN_SYSTEM.colors.neutral[200],
+                backgroundColor: DESIGN_SYSTEM.colors.light.surface,
+              }}
+            >
+              <View
+                style={{
+                  flexDirection: 'row',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                }}
+              >
+                <Text
+                  style={{
+                    fontSize: 20,
+                    fontWeight: '700',
+                    color: DESIGN_SYSTEM.colors.light.text,
+                  }}
+                >
+                  Select Payee
+                </Text>
+                <TouchableOpacity onPress={() => setShowPayeeModal(false)}>
+                  <MaterialIcons
+                    name="close"
+                    size={24}
+                    color={DESIGN_SYSTEM.colors.light.textSecondary}
+                  />
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Tab Navigation */}
+            <View
+              style={{
+                flexDirection: 'row',
+                backgroundColor: DESIGN_SYSTEM.colors.light.surface,
+                paddingHorizontal: 24,
+                paddingTop: 16,
+              }}
+            >
+              {[
+                { key: 'recent', label: 'Recent' },
+                { key: 'contacts', label: 'Contacts' },
+                { key: 'upi', label: 'UPI ID' },
+              ].map((tab) => (
+                <TouchableOpacity
+                  key={tab.key}
+                  style={{
+                    paddingHorizontal: 16,
+                    paddingVertical: 8,
+                    borderRadius: DESIGN_SYSTEM.borderRadius.md,
+                    marginRight: 8,
+                    backgroundColor:
+                      activeTab === tab.key ? DESIGN_SYSTEM.colors.primary[500] : 'transparent',
+                  }}
+                  onPress={() => setActiveTab(tab.key as any)}
+                >
+                  <Text
+                    style={{
+                      fontWeight: '600',
+                      color:
+                        activeTab === tab.key ? 'white' : DESIGN_SYSTEM.colors.light.textSecondary,
+                    }}
+                  >
+                    {tab.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {/* Tab Content */}
+            <ScrollView style={{ flex: 1, padding: 24 }}>
+              {activeTab === 'recent' && (
+                <View>
+                  {recentPayees.map((payee) => (
+                    <TouchableOpacity
+                      key={payee.vpa}
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        backgroundColor: DESIGN_SYSTEM.colors.light.surface,
+                        borderRadius: DESIGN_SYSTEM.borderRadius.lg,
+                        padding: 16,
+                        marginBottom: 12,
+                        borderWidth: 1,
+                        borderColor: DESIGN_SYSTEM.colors.neutral[200],
+                      }}
+                      onPress={() => handlePayeeSelect(payee)}
+                    >
+                      <View
+                        style={{
+                          width: 48,
+                          height: 48,
+                          borderRadius: 24,
+                          backgroundColor: DESIGN_SYSTEM.colors.primary[100],
+                          justifyContent: 'center',
+                          alignItems: 'center',
+                          marginRight: 16,
+                        }}
+                      >
+                        <Text
+                          style={{
+                            fontWeight: '700',
+                            fontSize: 18,
+                            color: DESIGN_SYSTEM.colors.primary[600],
+                          }}
+                        >
+                          {payee.name.charAt(0)}
+                        </Text>
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text
+                          style={{
+                            fontWeight: '600',
+                            fontSize: 16,
+                            color: DESIGN_SYSTEM.colors.light.text,
+                            marginBottom: 4,
+                          }}
+                        >
+                          {payee.name}
+                        </Text>
+                        <Text
+                          style={{
+                            color: DESIGN_SYSTEM.colors.light.textSecondary,
+                            fontSize: 14,
+                          }}
+                        >
+                          {payee.vpa}
+                        </Text>
+                      </View>
+                      <MaterialIcons
+                        name="chevron-right"
+                        size={20}
+                        color={DESIGN_SYSTEM.colors.light.textSecondary}
+                      />
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              )}
+
+              {activeTab === 'upi' && (
+                <View>
+                  <Text
+                    style={{
+                      fontSize: 16,
+                      fontWeight: '600',
+                      color: DESIGN_SYSTEM.colors.light.text,
+                      marginBottom: 16,
+                    }}
+                  >
+                    Enter UPI ID
+                  </Text>
+                  <TextInput
+                    style={{
+                      backgroundColor: DESIGN_SYSTEM.colors.light.surface,
+                      borderRadius: DESIGN_SYSTEM.borderRadius.lg,
+                      padding: 16,
+                      fontSize: 16,
+                      borderWidth: 1,
+                      borderColor: DESIGN_SYSTEM.colors.neutral[200],
+                      marginBottom: 24,
+                    }}
+                    value={vpaInput}
+                    onChangeText={setVpaInput}
+                    placeholder="Enter UPI ID (e.g., user@paytm)"
+                    placeholderTextColor={DESIGN_SYSTEM.colors.light.textSecondary}
+                    autoCapitalize="none"
+                  />
+                  {vpaInput && (
+                    <TouchableOpacity
+                      style={{
+                        backgroundColor: DESIGN_SYSTEM.colors.primary[500],
+                        paddingVertical: 16,
+                        borderRadius: DESIGN_SYSTEM.borderRadius.lg,
+                        alignItems: 'center',
+                      }}
+                      onPress={() => {
+                        if (vpaInput) {
+                          setSelectedPayee({
+                            phone: '',
+                            vpa: vpaInput,
+                            name: vpaInput.split('@')[0],
+                            handle: vpaInput.split('@')[1] || '',
+                          });
+                          setShowPayeeModal(false);
+                        }
+                      }}
+                    >
+                      <Text style={{ color: 'white', fontSize: 16, fontWeight: '600' }}>
+                        Select This UPI ID
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              )}
+
+              {activeTab === 'contacts' && (
+                <View
+                  style={{
+                    alignItems: 'center',
+                    paddingVertical: 40,
+                  }}
+                >
+                  <MaterialIcons
+                    name="contacts"
+                    size={48}
+                    color={DESIGN_SYSTEM.colors.neutral[400]}
+                  />
+                  <Text
+                    style={{
+                      fontSize: 16,
+                      color: DESIGN_SYSTEM.colors.light.textSecondary,
+                      textAlign: 'center',
+                      marginTop: 16,
+                    }}
+                  >
+                    Contact integration coming soon
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+          </View>
+        </Modal>
+      </View>
     </ScreenWrapper>
   );
 }
