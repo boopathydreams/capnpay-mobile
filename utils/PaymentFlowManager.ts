@@ -111,6 +111,15 @@ export class PaymentFlowManager {
       const escrowIntent = await response.json();
       console.log('✅ PaymentFlowManager: Escrow intent created', escrowIntent);
 
+      // Validate the response has required fields
+      if (!escrowIntent.referenceId) {
+        throw new Error('Invalid response: missing referenceId');
+      }
+
+      if (!escrowIntent.collectionLinks) {
+        console.warn('⚠️ PaymentFlowManager: Response missing collectionLinks', escrowIntent);
+      }
+
       // Step 2: Update state with collection data
       this.updateState({
         status: 'selecting_app',
@@ -136,12 +145,28 @@ export class PaymentFlowManager {
    */
   async selectUpiApp(appName: string): Promise<void> {
     console.log('🎯 PaymentFlowManager: UPI app selected', appName);
+    console.log('🔍 PaymentFlowManager: Current state before selectUpiApp:', this.state);
+
+    // Validate that we have a referenceId before proceeding
+    if (!this.state.referenceId) {
+      console.error('❌ PaymentFlowManager: Cannot select UPI app - no referenceId in state');
+      this.updateState({
+        status: 'failed',
+        message: 'Payment session invalid. Please try again.',
+        error: 'No reference ID available',
+        canRetry: true,
+      });
+      this.callbacks.onFailure('Payment session invalid. Please try again.', true);
+      return;
+    }
 
     this.updateState({
       status: 'waiting_in_app',
       message: `Complete payment in ${appName}...`,
       canRetry: false,
     });
+
+    console.log('🔍 PaymentFlowManager: State after updateState:', this.state);
 
     // Start status monitoring
     this.startStatusMonitoring();
@@ -373,7 +398,21 @@ export class PaymentFlowManager {
    * Update state and notify callbacks
    */
   private updateState(updates: Partial<PaymentFlowState>): void {
+    const oldState = { ...this.state };
     this.state = { ...this.state, ...updates };
+
+    // Log important state changes
+    if (updates.referenceId !== undefined) {
+      console.log(
+        `🔄 PaymentFlowManager: referenceId changed from ${oldState.referenceId} to ${this.state.referenceId}`,
+      );
+    }
+    if (updates.status !== undefined) {
+      console.log(
+        `🔄 PaymentFlowManager: status changed from ${oldState.status} to ${this.state.status}`,
+      );
+    }
+
     this.callbacks.onStateChange(this.state);
   }
 
