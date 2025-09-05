@@ -34,7 +34,8 @@ export default function TabLayout() {
           elevation: 3,
         },
         headerShown: false,
-      }}>
+      }}
+    >
       <Tabs.Screen
         name="index"
         options={{
@@ -50,10 +51,10 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
-        name="scan"
+        name="chat"
         options={{
-          title: 'Scan',
-          tabBarIcon: ({ color }) => <TabBarIcon name="qrcode" color={color} />,
+          title: 'AI Chat',
+          tabBarIcon: ({ color }) => <TabBarIcon name="comments" color={color} />,
         }}
       />
       <Tabs.Screen

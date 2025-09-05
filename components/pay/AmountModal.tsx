@@ -442,6 +442,7 @@ interface AmountModalProps {
   recipientName?: string;
   recipientVpa?: string;
   analysis?: PaymentAnalysis;
+  isAmountLocked?: boolean; // New prop for locking amount in merchant QRs
   // Optional callbacks for external handling
   onPaymentSuccess?: (referenceId: string) => void;
   onPaymentFailure?: (error: string) => void;
@@ -455,6 +456,7 @@ export const AmountModal: React.FC<AmountModalProps> = ({
   recipientName = 'Someone',
   recipientVpa = '',
   analysis,
+  isAmountLocked = false,
   onPaymentSuccess,
   onPaymentFailure,
 }) => {
@@ -824,18 +826,31 @@ export const AmountModal: React.FC<AmountModalProps> = ({
                   <Text style={styles.currencySymbol}>₹</Text>
                   <TextInput
                     ref={amountInputRef}
-                    style={styles.amountInput}
+                    style={[styles.amountInput, isAmountLocked && styles.amountInputLocked]}
                     value={amount}
-                    onChangeText={handleAmountChange}
+                    onChangeText={isAmountLocked ? undefined : handleAmountChange}
                     keyboardType="numeric"
                     placeholder="0"
                     placeholderTextColor={DESIGN_SYSTEM.colors.neutral[400]}
                     selectionColor={DESIGN_SYSTEM.colors.primary[500]}
-                    autoFocus
-                    onFocus={handleAmountFocus}
-                    pointerEvents="auto"
+                    autoFocus={!isAmountLocked}
+                    onFocus={isAmountLocked ? undefined : handleAmountFocus}
+                    pointerEvents={isAmountLocked ? 'none' : 'auto'}
+                    editable={!isAmountLocked}
                   />
                 </View>
+
+                {/* Locked Amount Indicator */}
+                {isAmountLocked && (
+                  <View style={styles.lockedIndicator}>
+                    <MaterialIcons
+                      name="lock"
+                      size={16}
+                      color={DESIGN_SYSTEM.colors.warning[600]}
+                    />
+                    <Text style={styles.lockedText}>Amount fixed by merchant</Text>
+                  </View>
+                )}
               </View>
 
               {numericAmount > 0 && (
@@ -1244,6 +1259,31 @@ const styles = StyleSheet.create({
     textAlign: 'left', // Align left so text starts immediately after currency
     paddingHorizontal: 0, // Remove any internal padding
     margin: 0, // Remove any margins
+  },
+  amountInputLocked: {
+    color: DESIGN_SYSTEM.colors.neutral[600],
+    backgroundColor: DESIGN_SYSTEM.colors.neutral[50],
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  lockedIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: DESIGN_SYSTEM.colors.warning[50],
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: DESIGN_SYSTEM.colors.warning[200],
+  },
+  lockedText: {
+    fontSize: 12,
+    color: DESIGN_SYSTEM.colors.warning[600],
+    fontWeight: '500',
+    marginLeft: 4,
   },
   amountWords: {
     fontSize: 14,
